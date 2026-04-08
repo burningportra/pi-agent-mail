@@ -84,15 +84,28 @@ export default function piAgentMailExtension(pi: ExtensionAPI) {
   });
 
   // ── Session bootstrap ─────────────────────────────────────
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
+    const reason = (event as unknown as { reason?: string }).reason ?? "startup";
     projectKey = ctx.cwd;
     bootstrapped = false;
-    agentName = "";
     urgentMessages = [];
 
     if (!(await isServerUp())) {
       if (ctx.hasUI) ctx.ui.notify("pi-agent-mail: server not running — start with `am`", "warning");
       return;
+    }
+
+    // On resume/reload: recover stored identity from session history
+    let storedName: string | undefined;
+    if (reason === "resume" || reason === "reload") {
+      for (const entry of ctx.sessionManager.getEntries()) {
+        if (
+          entry.type === "custom" &&
+          (entry as unknown as { customType?: string }).customType === "am-identity"
+        ) {
+          storedName = (entry as unknown as { data?: { agentName?: string } }).data?.agentName;
+        }
+      }
     }
 
     try {
@@ -101,6 +114,8 @@ export default function piAgentMailExtension(pi: ExtensionAPI) {
         program: "pi",
         model: currentModel,
         task_description: "",
+        // Re-register under the same name if resuming; let server auto-generate for new sessions
+        agent_name: storedName ?? null,
         inbox_limit: 5,
       });
 
@@ -109,8 +124,13 @@ export default function piAgentMailExtension(pi: ExtensionAPI) {
         inbox?: Array<{ importance?: string; subject?: string; id?: number }>;
       } | undefined;
 
-      agentName = sc?.agent?.name ?? "";
+      agentName = sc?.agent?.name ?? storedName ?? "";
       bootstrapped = !!agentName;
+
+      // Persist identity in session so resume can recover it
+      if (bootstrapped && reason !== "resume" && reason !== "reload") {
+        pi.appendEntry("am-identity", { agentName, projectKey });
+      }
 
       // Collect urgent unread messages for before_agent_start injection
       if (sc?.inbox) {
@@ -360,6 +380,30 @@ export default function piAgentMailExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: `Agent: ${agentName}\nProject: ${projectKey}\nModel: ${currentModel}` }],
         details: {},
       };
+    },
+  });
+
+  // ── am_agents ─────────────────────────────────────
+  pi.registerTool({
+    name: "am_agents",
+    label: "Agent Mail Recent Activity",
+    description:
+      "Show recent Agent Mail activity: who has been messaging and what they've been working on. Use to discover other active agents.",
+    promptSnippet: "Show recent Agent Mail activity and active agents",
+    parameters: Type.Object({
+      since_hours: Type.Optional(
+        Type.Number({ description: "Hours to look back (default 1)" })
+      ),
+    }),
+    async execute(_id, params) {
+      const err = requireBootstrap();
+      if (err) return { content: [{ type: "text", text: err }], details: {} };
+      const result = await amRpc("summarize_recent", {
+        project_key: projectKey,
+        since_hours: params.since_hours ?? 1,
+        llm_mode: false,
+      });
+      return { content: [{ type: "text", text: rpcText(result) }], details: {} };
     },
   });
 
